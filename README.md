@@ -13,23 +13,31 @@ yasashii report.html
 
 Reports are written for people who already know the domain. The same report is then
 read by people who do not. This skill produces a second copy where the body text is
-rewritten in easy Japanese, while code, numbers, tables, links and layout stay byte-identical.
+rewritten in easy Japanese, while code, links, attributes and markup are protected.
+Table prose may change; numerical literals and their units must be preserved.
 
 It is a **reading aid**, not a replacement: the original stays the source of truth.
 
 ## How it works
 
 - Translates only HTML text nodes, sentence by sentence (chunks of ~250 chars).
-- Uses `target_lang="ja(easy)"`, an undocumented mode of PLaMo 3 Translate that
+- Uses official PFML3 `target_lang="ja-easy"`, explicit `source_lang="ja"` and
+  temperature-zero greedy decoding. This
   rewrites Japanese into Japanese instead of translating to another language.
-- Skips `<code>`, `<pre>`, `<script>`, `<style>`, `<svg>`, all attributes, inline
-  fragments split by `<strong>`/`<a>` and sentence fragments that start with a particle.
+- Uses HTMLParser source offsets, not text searching: repeated text in an
+  attribute, comment or script cannot redirect an edit there.
+- Skips links, code, scripts, styles, SVG, attributes, non-sentence labels,
+  URL/path/backtick-containing nodes and continuations starting with particles.
 - Reverts a sentence to the original when:
-  - numbers changed (a newly introduced `1` from `単一` → `1つ` is allowed),
+  - numbers or units changed (including added `1`s),
   - a code identifier or backticked string disappeared,
   - Japanese turned into English, or a new Latin word appeared,
   - the length ratio falls outside 0.5–2.2x,
-  - a label of 15 chars or fewer became a sentence.
+  - a label of 15 chars or fewer became a sentence,
+  - a complete sentence was cut off without terminal punctuation.
+- Preserves capitalized Latin names and reverts suspected loss of an explicit
+  removal action (`除外` / `削除` / `落とし`). This is a conservative lexical check,
+  not a general semantic validator.
 - Prints a JSON summary: nodes, chars, reverted sentences with reasons, unmatched positions.
 
 ## Install
@@ -58,16 +66,18 @@ This creates `~/.local/share/yasashii/venv` with `mlx-lm`, `transformers`, `numb
 ```bash
 yasashii report.html
 yasashii report.html --model 2b --glossary terms.json
+yasashii report.html --context background.txt
 yasashii report.html --limit 20      # try the first 20 sentences
 yasashii report.html --dry-run       # count target sentences only
 ```
 
 | Option | Meaning |
 |---|---|
-| `--model 0.8b` | Default. ~40s for a 10k-char report on M3 Pro |
-| `--model 2b` | Keeps technical terms, fewer reverts, ~4 min for the same report |
+| `--model 0.8b` | Default. Small, fast; technical jargon often remains |
+| `--model 2b` | Alternative; not automatically more faithful |
 | `--model 8b` | 6GB, not benchmarked here |
 | `--glossary terms.json` | Fix terminology (see below) |
+| `--context background.txt` | Optional reference context; not enabled by default |
 | `--out path.html` | Output path |
 | `--limit N` | Convert only the first N sentences |
 | `--dry-run` | Report counts without converting |
@@ -87,24 +97,76 @@ and particles are still handled:
 Without a glossary the 0.8B model leaves katakana loanwords untouched, and can mistranslate
 technical terms (`埋め込みベクトル` → `埋め込まれたベクトル`).
 
-## Measured on a real report
+## Measured results (2026-11-11)
 
-9,800 characters / 265 sentences, Apple M3 Pro:
+18 diagnostic inputs (13 prose, 2 labels, 3 protected inputs), Apple M3 Pro,
+three sequential sweeps per variant. Times are medians, excluding model loading.
+The safer variants rewrite 13 inputs; the others are intentionally preserved.
 
-| Model | Weights | Time | Sentences reverted |
+| Model / variant | Time | Observed language outcome |
+|---|---|---|
+| 0.8b / safer default | 1.135s | Keeps embedding terminology, jargon remains |
+| 0.8b / glossary | 1.466s | Rewrites all four selected technical terms |
+| 2b / safer default | 6.378s | Confuses latency with availability in one example |
+| 2b / glossary | 7.869s | Fixes that example; embedding jargon remains |
+| 2b / glossary + context | 8.365s | That latency error returns |
+
+All 18 inputs preserve numeric literals; outputs match across all three repeats.
+These checks are not an overall meaning-accuracy score or a reader study.
+
+A separate end-to-end report run (one run each, 71,912 input bytes):
+
+| Variant | Candidate nodes | Time | Protected elements / numbers preserved |
 |---|---|---|---|
-| 0.8b | 0.98GB | 37s | 6 |
-| 2b | 2.42GB | 231s | 2 |
+| Old CLI (`0038c01`) | 265 | 32.536s | No / No |
+| Safer default | 135 | 19.429s | Yes / Yes |
+| Safer + glossary | 135 | 21.532s | Yes / Yes |
 
-Tags, links and numbers were identical to the original in both runs.
+The safer selection processes 6,099 chars vs the old 9,799: the lower runtime
+does **not** establish faster inference. Safety is gained partly by preserving
+more source text. The old run rewrote a title and an anchor and introduced two
+extra `1`s; earlier informal preservation claims were incomplete.
+An adversarial repeated-text HTML suite passes 1/8 old vs 8/8 new.
+Ten unit tests pass. Semantic changes beyond lexical checks still require review.
 
-0.8B stays close to the original sentence structure; 2B splits sentences and explains
-more, but occasionally adds a claim that was not in the source. Both need a human read.
+## Accuracy regression benchmark
+
+```bash
+python -m unittest discover -s tests -v
+python bench/safety.py
+python bench/run.py --model 0.8b --output /mounted-storage/0.8b.json
+python bench/run.py --model 2b --output /mounted-storage/2b.json
+python bench/report.py report.html --output-dir /mounted-storage/report-bench
+```
+
+Use the Python environment created by `setup.sh`.
+The benchmark freezes the old implementation at commit `0038c01`.
+It compares the old language-code path, explicit source/target, conservative HTML
+selection, glossary, context, and glossary+context on 18 diagnostic examples.
+Safety, numeric preservation, rewrite coverage and observed semantic errors are
+separate measures: an unchanged sentence is safe, but not a simplification.
+Glossaries help technical vocabulary; context+glossary can still make a sentence
+worse. Neither is a hard constraint or an automatic guarantee of meaning.
+
+### Why these changes
+
+- [Official MLX chat template](https://huggingface.co/pfnet/plamo-3-translate-2b-MLX-4bit/blob/main/chat_template.jinja)
+  normalizes `ja(easy)` to PFML3 `ja-easy`. The older mixed34 template did not,
+  so using the canonical code avoids relying on the alias implementation.
+- [Official MLX model card](https://huggingface.co/pfnet/plamo-3-translate-2b-MLX-4bit)
+  documents glossary and reference context, and uses temperature-zero sampling.
+  They are translation inputs, not hard fidelity constraints.
+- [Japanese simplification research (Urakawa et al., 2024)](https://aclanthology.org/2024.lrec-main.57/)
+  and [READI 2024](https://aclanthology.org/2024.readi-1.1/) motivate inspecting
+  additions/omissions and evaluating simplicity separately from meaning.
+
+Larger models, more context and a larger glossary are not automatically better.
+Use a short, reviewed glossary; inspect negation, conditions, actions and uncertainty.
 
 ## Requirements
 
 - Apple Silicon Mac (MLX), Python 3.12+
-- ~1GB of disk per model, plus ~650MB for the venv
+- Weights: ~423MB (0.8b), ~2.4GB (2b), ~6GB (8b), plus the Python environment
 
 ## License
 

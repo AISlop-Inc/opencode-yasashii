@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """やさしい日本語コンバータ（HTML）
 
-PLaMo 3 Translate の target_lang="ja(easy)" で、HTML のテキストノードだけを
+PLaMo 3 Translate の target_lang="ja-easy" で、HTML のテキストノードだけを
 文単位でやさしい日本語に変換し、<name>.yasashii.html を併産する。
 原文ファイルは変更しない。
 
@@ -13,14 +13,13 @@ PLaMo 3 Translate の target_lang="ja(easy)" で、HTML のテキストノード
 from __future__ import annotations
 
 import argparse
-import glob
 import html as html_mod
 import importlib.util
 import json
-import os
 import re
 import sys
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 
 MODELS = {
@@ -49,6 +48,7 @@ def load_engine(model_key: str):
     from mlx_lm import generate
     from mlx_lm.tokenizer_utils import TokenizerWrapper
     from mlx_lm.utils import load_model
+    from mlx_lm.sample_utils import make_sampler
 
     repo = MODELS[model_key]
     snap = Path(snapshot_download(repo))
@@ -74,49 +74,30 @@ def load_engine(model_key: str):
     model = loaded[0] if isinstance(loaded, tuple) else loaded
     wrap = TokenizerWrapper(tok)
     wrap.add_eos_token("<|plamo:tag|>")
+    wrap.add_eos_token("<|plamo:bos|>")
 
-    def easy(text: str, glossary=None, max_tokens: int = 512) -> str:
+    def easy(text: str, glossary=None, max_tokens: int = 512, context=None,
+             target="ja-easy", source="ja") -> str:
         kw = {"glossary": glossary} if glossary else {}
+        if context:
+            kw["context"] = context
+        if source:
+            kw["source_lang"] = source
         prompt = tok.apply_chat_template(
             [{"role": "user", "content": text}],
-            target_lang="ja(easy)",
+            target_lang=target,
             add_generation_prompt=True,
             tokenize=False,
             **kw,
         )
-        return generate(model, wrap, prompt=prompt, max_tokens=max_tokens, verbose=False)
+        return generate(model, wrap, prompt=prompt, max_tokens=max_tokens, verbose=False,
+                        sampler=make_sampler(temp=0))
 
     return easy
 
 
-INLINE = {
-    "strong", "em", "b", "i", "span", "a", "small", "sup", "sub", "mark", "time", "label",
-}
 # 文の途中で分断された断片の先頭に来る助詞・接続（前のノードの続きなので単独変換しない）
 CONT_START = ("を", "が", "は", "に", "で", "と", "も", "へ", "や", "の", "から", "まで", "より", "であり")
-
-
-def collect_nodes(raw: str):
-    from bs4 import BeautifulSoup, NavigableString
-
-    soup = BeautifulSoup(raw, "html.parser")
-    out = []
-    for s in soup.find_all(string=True):
-        if not isinstance(s, NavigableString):
-            continue
-        if any(p.name in SKIP_TAGS for p in s.parents if getattr(p, "name", None)):
-            continue
-        text = str(s)
-        if len(text.strip()) < 6 or not JP.search(text):
-            continue
-        # インライン要素に分断された短い断片は文脈がなく誤変換しやすい
-        parent = getattr(s.parent, "name", None)
-        if parent in INLINE and len(text.strip()) < 15:
-            continue
-        if text.strip().startswith(CONT_START):
-            continue
-        out.append(text)
-    return out
 
 
 def split_lead_trail(text: str):
@@ -143,6 +124,7 @@ def chunk(core: str, size: int = 250):
 
 def protected_tokens(text: str):
     toks = set(re.findall(r"`[^`]+`", text))
+    toks |= set(re.findall(r"(?<![A-Za-z0-9])[A-Z][A-Za-z0-9-]*(?![A-Za-z0-9])", text))
     toks |= set(re.findall(r"[A-Za-z][A-Za-z0-9]*(?:[._][A-Za-z0-9]+)+", text))
     toks |= set(re.findall(r"[A-Za-z][A-Za-z0-9]*\(\)", text))
     return toks
@@ -154,13 +136,17 @@ def verify(src: str, out: str) -> str | None:
         return "empty"
     if FORBIDDEN in out:
         return "special-token"
-    src_nums = sorted(NUM.findall(src))
-    out_nums = sorted(NUM.findall(out))
-    if src_nums != out_nums:
-        # 単一→1つ のように新しく立つ「1」だけは許す
-        if not (sorted(src_nums + ["1"] * (len(out_nums) - len(src_nums))) == out_nums
-                and len(out_nums) > len(src_nums)):
-            return "numbers-changed"
+    if src.endswith(("。", "！", "？")) and not out.strip().endswith(("。", "！", "？")):
+        return "incomplete-sentence"
+    if sorted(NUM.findall(src)) != sorted(NUM.findall(out)):
+        return "numbers-changed"
+    quantities = r"\d+(?:[.,]\d+)*\s*(?:ms|[kMGT]?B|秒|分|時間|日|回|件|%|％)"
+    if sorted(re.findall(quantities, src)) != sorted(re.findall(quantities, out)):
+        return "units-changed"
+    # 「出力を落とす→出力を取る」で除外が取得に反転した実例を保守的に戻す。
+    if re.search(r"除外|削除|取り除|落とし", src) and not re.search(
+            r"除外|削除|取り除|除い|除き|消し|削っ|外し|落と", out):
+        return "removal-action-lost"
     missing = protected_tokens(src) - set(protected_tokens(out))
     if missing:
         return f"code-changed:{sorted(missing)[:2]}"
@@ -181,23 +167,68 @@ def verify(src: str, out: str) -> str | None:
     return None
 
 
-def replace_sequential(raw: str, nodes, translated):
-    """本文中のテキストを出現順に置換する。戻り値は (変換後, 未一致件数)。"""
-    pos = 0
-    unmatched = 0
-    for original, new in zip(nodes, translated):
-        idx = raw.find(original, pos)
-        if idx < 0:
-            esc = html_mod.escape(original, quote=False)
-            idx = raw.find(esc, pos)
-            if idx >= 0:
-                original = esc
-        if idx < 0:
-            unmatched += 1
-            continue
-        raw = raw[:idx] + new + raw[idx + len(original):]
-        pos = idx + len(new)
-    return raw, unmatched
+class TextSpans(HTMLParser):
+    """Keep source offsets; never search for text inside tags or protected content."""
+
+    def __init__(self, raw):
+        super().__init__(convert_charrefs=False)
+        self.starts = [0]
+        for m in re.finditer("\n", raw):
+            self.starts.append(m.end())
+        self.stack = []
+        self.spans = []
+        self.feed(raw)
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input",
+                       "link", "meta", "param", "source", "track", "wbr"}:
+            self.stack.append(tag)
+
+    def handle_startendtag(self, tag, attrs):
+        pass
+
+    def handle_endtag(self, tag):
+        if tag in self.stack:
+            self.stack = self.stack[:len(self.stack) - 1 - self.stack[::-1].index(tag)]
+
+    def handle_data(self, data):
+        line, col = self.getpos()
+        start = self.starts[line - 1] + col
+        if any(t in SKIP_TAGS | {"a"} for t in self.stack):
+            return
+        # Only complete sentences are rewritten. Fragment rewriting loses referents.
+        text = data.strip()
+        if len(text) < 6 or not JP.search(text) or not text.endswith(("。", "！", "？")):
+            return
+        if text.startswith(CONT_START):
+            return
+        if re.search(r"https?://|(?:~|/)[\w./-]+|`", text):
+            return
+        self.spans.append((start, start + len(data), data))
+
+
+def convert_html(raw, easy, glossary=None, limit=None, context=None):
+    spans = TextSpans(raw).spans
+    if limit is not None:
+        spans = spans[:limit]
+    edits, reverted = [], []
+    for start, end, text in spans:
+        lead, core, trail = split_lead_trail(text)
+        parts = []
+        for part in chunk(core):
+            out = easy(part, glossary, max_tokens=max(96, min(2048, int(len(part) * 2.5))),
+                       context=context).strip()
+            reason = verify(part, out)
+            if reason:
+                reverted.append({"reason": reason, "src": part, "out": out})
+            parts.append(part if reason else out)
+        edits.append((start, end, lead + html_mod.escape("".join(parts), quote=False) + trail))
+    for start, end, replacement in reversed(edits):
+        raw = raw[:start] + replacement + raw[end:]
+    return raw, {
+        "nodes": len(spans), "chars": sum(len(t) for _, _, t in spans),
+        "reverted": len(reverted), "unmatched": 0, "reverted_detail": reverted[:5],
+    }
 
 
 def main():
@@ -208,6 +239,7 @@ def main():
     ap.add_argument("--out", help="出力先（既定: <name>.yasashii.html）")
     ap.add_argument("--limit", type=int, help="先頭N件だけ変換（試用）")
     ap.add_argument("--dry-run", action="store_true", help="対象件数だけ表示")
+    ap.add_argument("--context", help="用語や背景の参照テキスト（指示文ではない）")
     args = ap.parse_args()
 
     src_path = Path(args.file).expanduser()
@@ -215,9 +247,12 @@ def main():
         die(f"ファイルがありません: {src_path}")
     if src_path.name.endswith(".yasashii.html"):
         die("やさしい版を入力にしています")
+    out_path = Path(args.out).expanduser() if args.out else src_path.with_suffix(".yasashii.html")
+    if out_path.resolve() == src_path.resolve():
+        die("出力先に原文は指定できません")
 
     raw = src_path.read_text(encoding="utf-8")
-    nodes = collect_nodes(raw)
+    nodes = [text for _, _, text in TextSpans(raw).spans]
     if args.limit:
         nodes = nodes[: args.limit]
     if not nodes:
@@ -235,41 +270,17 @@ def main():
     easy = load_engine(args.model)
     load_s = time.time() - t0
 
-    translated, reverted = [], []
     t1 = time.time()
-    for i, text in enumerate(nodes, 1):
-        lead, core, trail = split_lead_trail(text)
-        pieces = []
-        for part in chunk(core):
-            out = easy(part, glossary, max_tokens=max(96, min(2048, int(len(part) * 2.5))))
-            reason = verify(part, out)
-            if reason:
-                reverted.append({"reason": reason, "src": part, "out": out.strip()})
-                pieces.append(part)
-            else:
-                pieces.append(out.strip())
-            if sys.stderr.isatty():
-                print(f"\r  {i}/{len(nodes)}", end="", file=sys.stderr, flush=True)
-        translated.append(lead + "".join(pieces) + trail)
-    if sys.stderr.isatty():
-        print("", file=sys.stderr)
-
-    out_raw, unmatched = replace_sequential(raw, nodes, translated)
-    out_path = Path(args.out).expanduser() if args.out else \
-        src_path.with_name(src_path.name[:-5] + ".yasashii.html")
+    context = Path(args.context).expanduser().read_text(encoding="utf-8") if args.context else None
+    out_raw, stats = convert_html(raw, easy, glossary, args.limit, context)
     out_path.write_text(out_raw, encoding="utf-8")
 
     elapsed = time.time() - t1
-    chars = sum(len(n) for n in nodes)
     print(json.dumps({
         "input": str(src_path),
         "output": str(out_path),
         "model": args.model,
-        "nodes": len(nodes),
-        "chars": chars,
-        "reverted": len(reverted),
-        "unmatched": unmatched,
-        "reverted_detail": reverted[:5],
+        **stats,
         "load_s": round(load_s, 2),
         "convert_s": round(elapsed, 2),
     }, ensure_ascii=False, indent=1))
