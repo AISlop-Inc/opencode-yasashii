@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# シンボリックリンク経由で呼ばれても本体の場所を解決する
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  case "$SOURCE" in
+    /*) ;;
+    *) SOURCE="$DIR/$SOURCE" ;;
+  esac
+done
+DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
 ROOT="${YASASHII_HOME:-$HOME/.local/share/yasashii}"
 PY="$ROOT/venv/bin/python"
 
 if [ ! -x "$PY" ]; then
-  echo "yasashii: 初回セットアップが必要です: bash $(cd "$(dirname "$0")/.." && pwd)/setup.sh" >&2
+  echo "yasashii: 初回セットアップが必要です: bash $(cd "$DIR/.." && pwd)/setup.sh" >&2
   exit 1
 fi
 
-exec "$PY" "$(dirname "$0")/yasashii.py" "$@"
+exec "$PY" "$DIR/yasashii.py" "$@"

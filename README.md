@@ -37,9 +37,12 @@ It is a **reading aid**, not a replacement: the original stays the source of tru
 ```bash
 git clone git@github.com:AISlop-Inc/opencode-yasashii.git
 cd opencode-yasashii
-./install.sh          # symlinks skills/yasashii into ~/.config/opencode/skills/yasashii
+./install.sh          # links skills/yasashii into ~/.config/opencode/skills/yasashii
 ./install.sh --copy   # copies instead of symlinking
 ```
+
+`install.sh` also links the `yasashii` command into `~/.local/bin`, so it can be
+called from any shell.
 
 First run of the converter needs its Python environment:
 
