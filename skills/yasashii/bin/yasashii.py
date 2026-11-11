@@ -189,6 +189,7 @@ class TextSpans(HTMLParser):
         self.stack = []
         self.root = {"tag": "", "split": False}
         self.candidates = []
+        self.labels = []
         self.feed(raw)
         self.spans = [(start, end, text) for start, end, text, parent in self.candidates
                       if not parent["split"]]
@@ -198,7 +199,8 @@ class TextSpans(HTMLParser):
         parent["split"] = True
         if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input",
                        "link", "meta", "param", "source", "track", "wbr"}:
-            self.stack.append({"tag": tag, "split": False})
+            self.stack.append({"tag": tag, "split": False,
+                               "classes": set((dict(attrs).get("class") or "").split())})
 
     def handle_startendtag(self, tag, attrs):
         parent = self.stack[-1] if self.stack else self.root
@@ -223,6 +225,25 @@ class TextSpans(HTMLParser):
     def handle_data(self, data):
         line, col = self.getpos()
         start = self.starts[line - 1] + col
+        names = [t["tag"] for t in self.stack]
+        text = data.strip()
+        label_tags = {"h1", "h2", "h3", "h4", "h5", "h6", "label", "caption",
+                      "summary", "th", "dt", "a"}
+        frame = next((t for t in reversed(self.stack)
+                      if t["tag"] in label_tags or "label" in t.get("classes", set())),
+                     self.stack[-1] if self.stack else self.root)
+        tag = frame["tag"]
+        classes = frame.get("classes", set())
+        span_label = (tag != "span" or (
+            not classes.intersection({"sentence", "value", "num", "number"})
+            and (len(text) >= 6 or "label" in classes)))
+        if (JP.search(text) and not any(t in SKIP_TAGS | {"code"} for t in names)
+                and span_label
+                and tag in {"h1", "h2", "h3", "h4", "h5", "h6", "span", "label",
+                            "caption", "summary", "th", "dt", "a"}
+                and not text.endswith(("。", "！", "？"))):
+            self.labels.append({"tag": tag, "line": line, "text": text,
+                                "reason": "unconverted-label"})
         if any(t["tag"] in SKIP_TAGS | {"a", "strong", "em", "span", "b", "i", "mark", "small",
                                       "sup", "sub"} for t in self.stack):
             return
@@ -238,10 +259,11 @@ class TextSpans(HTMLParser):
         self.candidates.append((start, start + len(data), data, parent))
 
 
-def prose_spans(raw, markdown=False):
+def prose_spans(raw, markdown=False, review_labels=None):
     """Select complete prose lines, keeping document syntax outside edit ranges."""
     lines = raw.splitlines(keepends=True)
     allowed = set(range(len(lines)))
+    label_lines = set()
     if markdown:
         from markdown_it import MarkdownIt
 
@@ -250,6 +272,14 @@ def prose_spans(raw, markdown=False):
         for token in MarkdownIt("commonmark").parse(raw):
             if token.nesting == -1:
                 ancestors.pop()
+            if (review_labels is not None and token.type == "inline" and token.map
+                    and "blockquote_open" not in ancestors and JP.search(token.content)
+                    and ("heading_open" in ancestors
+                         or any(c.type == "link_open" for c in token.children or []))):
+                review_labels.append({"tag": "heading" if "heading_open" in ancestors else "link-label",
+                                      "line": token.map[0] + 1,
+                                      "text": token.content, "reason": "unconverted-label"})
+                label_lines.update(range(*token.map))
             if token.type == "inline" and token.map and "blockquote_open" not in ancestors:
                 if all(c.type in {"text", "softbreak"} for c in token.children or []):
                     start, end = token.map
@@ -293,6 +323,12 @@ def prose_spans(raw, markdown=False):
         protected = re.search(r'https?://|(?:~|/)[\w./-]+|[`<>\\「『]|"[^"]+"', content)
         if markdown and "|" in content:
             protected = True
+        if (review_labels is not None and i in allowed and i not in label_lines
+                and JP.search(text) and len(text) >= 6 and not protected
+                and not text.startswith((">", "「", "『", '"'))
+                and not text.endswith(("。", "！", "？"))):
+            review_labels.append({"tag": "label", "line": i + 1, "text": text,
+                                  "reason": "unconverted-label"})
         if (i in allowed and len(text) >= 6 and JP.search(text)
                 and text.endswith(("。", "！", "？"))
                 and not text.startswith(CONT_START + (">", "「", "『", '"'))
@@ -308,8 +344,17 @@ def document_spans(raw, format):
     return prose_spans(raw, markdown=format == "markdown")
 
 
+def document_review_items(raw, format):
+    if format == "html":
+        return TextSpans(raw).labels
+    labels = []
+    prose_spans(raw, markdown=format == "markdown", review_labels=labels)
+    return labels
+
+
 def convert_document(raw, easy, glossary=None, limit=None, context=None, format="text"):
     spans = document_spans(raw, format)
+    labels = document_review_items(raw, format)
     if limit is not None:
         spans = spans[:limit]
     edits, reverted = [], []
@@ -343,7 +388,8 @@ def convert_document(raw, easy, glossary=None, limit=None, context=None, format=
     return raw, {
         "nodes": len(spans), "chars": sum(len(t) for _, _, t in spans),
         "reverted": len(reverted), "unmatched": 0, "reverted_detail": reverted[:5],
-        "changed_parts": changed_parts, "review_required": changed_parts > 0,
+        "changed_parts": changed_parts, "review_required": changed_parts > 0 or bool(labels),
+        "unconverted_labels": labels,
     }
 
 
@@ -360,7 +406,7 @@ def main():
     ap.add_argument("--glossary", help="用語集JSON（[{\"source\":..,\"target\":..}]）")
     ap.add_argument("--out", help="出力先（既定: <name>.yasashii.<元の拡張子>）")
     ap.add_argument("--limit", type=int, help="先頭N件だけ変換（試用）")
-    ap.add_argument("--dry-run", action="store_true", help="対象件数だけ表示")
+    ap.add_argument("--dry-run", action="store_true", help="対象件数と未変換の見出し・ラベルを表示")
     ap.add_argument("--context", help="用語や背景の参照テキスト（指示文ではない）")
     args = ap.parse_args()
 
@@ -374,7 +420,7 @@ def main():
     format = args.format or (formats.get(src_path.suffix.lower()) if src_path else "text")
     if format is None:
         die("未対応の拡張子です。文章なら --format text を指定してください")
-    if src_path and ".yasashii" in src_path.stem:
+    if src_path and ".yasashii" in src_path.stem and not args.dry_run:
         die("やさしい版を入力にしています")
     stream = args.stdout or (src_path is None and args.out is None)
     out_path = Path(args.out).expanduser() if args.out else (
@@ -392,7 +438,9 @@ def main():
     if args.limit is not None:
         nodes = nodes[: args.limit]
     if args.dry_run:
-        print(json.dumps({"nodes": len(nodes), "chars": sum(len(n) for n in nodes)},
+        labels = document_review_items(raw, format)
+        print(json.dumps({"nodes": len(nodes), "chars": sum(len(n) for n in nodes),
+                          "review_required": bool(labels), "unconverted_labels": labels},
                          ensure_ascii=False))
         return
 

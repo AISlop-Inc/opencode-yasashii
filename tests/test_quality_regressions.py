@@ -83,6 +83,61 @@ class QualityRegressions(unittest.TestCase):
             self.assertEqual(raw, out)
             self.assertEqual(stats["nodes"], 0)
 
+    def test_unconverted_html_heading_requires_review(self):
+        heading = "起動平均は2.50秒、追加千環境でも3.25秒"
+        raw = f"<h2>{heading}</h2><span>追加千環境のCold平均</span>"
+        out, stats = y.convert_html(raw, lambda *a, **kw: self.fail("label rewritten"))
+        self.assertEqual(raw, out)
+        self.assertEqual(stats["changed_parts"], 0)
+        self.assertTrue(stats["review_required"])
+        self.assertEqual(stats["unconverted_labels"][0]["text"], heading)
+        self.assertEqual(len(stats["unconverted_labels"]), 2)
+
+    def test_unconverted_markdown_heading_requires_review(self):
+        raw = "# 追加千環境でも3.25秒\n"
+        out, stats = y.convert_document(raw, None, format="markdown")
+        self.assertEqual(raw, out)
+        self.assertTrue(stats["review_required"])
+        self.assertEqual(stats["unconverted_labels"][0]["tag"], "heading")
+
+    def test_formatted_heading_and_metric_label_require_review(self):
+        raw = '<h2><strong>追加千環境でも3.25秒</strong></h2><span class="label"><em>追加測定の平均時間</em></span>'
+        _, stats = y.convert_html(raw, None)
+        self.assertTrue(stats["review_required"])
+        self.assertEqual(len(stats["unconverted_labels"]), 2)
+
+    def test_unconverted_text_label_requires_review(self):
+        raw = "追加千環境のCold平均\n"
+        out, stats = y.convert_document(raw, None)
+        self.assertEqual(raw, out)
+        self.assertTrue(stats["review_required"])
+
+    def test_contents_link_label_requires_review(self):
+        for raw, format in [
+            ('<nav><a href="#long-run">千環境の追加測定</a></nav>', "html"),
+            ("- [千環境の追加測定](#long-run)\n", "markdown"),
+        ]:
+            out, stats = y.convert_document(raw, None, format=format)
+            self.assertEqual(raw, out)
+            self.assertTrue(stats["review_required"])
+            self.assertIn("千環境", stats["unconverted_labels"][0]["text"])
+
+    def test_dry_run_can_audit_finished_document(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.yasashii.md"
+            path.write_text("# 追加千環境でも3.25秒\n")
+            result = subprocess.run([sys.executable, y.__file__, str(path), "--dry-run"],
+                                    capture_output=True, text=True, check=True)
+            self.assertIn("unconverted_labels", result.stdout)
+            self.assertIn('"review_required": true', result.stdout)
+
+    def test_protected_code_is_not_an_unconverted_label(self):
+        for raw, format in [("<pre>追加千環境でも3.25秒</pre>", "html"),
+                            ("```\n# 追加千環境でも3.25秒\n```\n", "markdown")]:
+            _, stats = y.convert_document(raw, None, format=format)
+            self.assertEqual(stats["unconverted_labels"], [])
+            self.assertFalse(stats["review_required"])
+
 
 if __name__ == "__main__":
     unittest.main()
