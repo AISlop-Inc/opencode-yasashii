@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="${YASASHII_HOME:-$HOME/.local/share/yasashii}"
+PY="$ROOT/venv/bin/python"
+
+if [ ! -x "$PY" ]; then
+  echo "yasashii: 初回セットアップが必要です: bash $(cd "$(dirname "$0")/.." && pwd)/setup.sh" >&2
+  exit 1
+fi
+
+exec "$PY" "$(dirname "$0")/yasashii.py" "$@"
