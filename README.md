@@ -1,12 +1,17 @@
 # opencode-yasashii
 
-An OpenCode skill that rewrites HTML deliverables into easy Japanese with a local
+An OpenCode skill and CLI that finish Japanese prose in easy Japanese with a local
 [PLaMo 3 Translate](https://huggingface.co/pfnet/plamo-3-translate-0.8b) model (MLX, Apple Silicon).
 
-`report.html` → `report.yasashii.html`. The original is never modified.
+Use it for final replies, explanations, email drafts and document/slide prose
+before rendering them. Existing text, Markdown and HTML files can also be rewritten.
+The original file is never modified.
 
 ```
 yasashii report.html
+yasashii notes.md
+yasashii message.txt
+printf '当該機能を無効化する必要があります。' | yasashii
 ```
 
 ## Why this exists
@@ -20,7 +25,10 @@ It is a **reading aid**, not a replacement: the original stays the source of tru
 
 ## How it works
 
-- Translates only HTML text nodes, sentence by sentence (chunks of ~250 chars).
+- Shares one rewriting/validation pipeline across plain text, Markdown and HTML.
+  stdin/stdout lets agents finish prose before putting it into any final format.
+- Text files become `name.yasashii.txt`, Markdown becomes `name.yasashii.md`,
+  and HTML becomes `name.yasashii.html`.
 - Uses official PFML3 `target_lang="ja-easy"`, explicit `source_lang="ja"` and
   temperature-zero greedy decoding. This
   rewrites Japanese into Japanese instead of translating to another language.
@@ -28,6 +36,10 @@ It is a **reading aid**, not a replacement: the original stays the source of tru
   attribute, comment or script cannot redirect an edit there.
 - Skips links, code, scripts, styles, SVG, attributes, non-sentence labels,
   URL/path/backtick-containing nodes and continuations starting with particles.
+- Markdown uses CommonMark parsing (`markdown-it-py`) and source offsets to keep
+  fences, indented code, quotes, links, emphasis and embedded HTML intact.
+  YAML front matter and pipe tables are also kept. Complex marked-up paragraphs
+  are preserved rather than partially rewritten without context.
 - Reverts a sentence to the original when:
   - numbers or units changed (including added `1`s),
   - a code identifier or backticked string disappeared,
@@ -59,12 +71,17 @@ bash ~/.config/opencode/skills/yasashii/setup.sh
 ```
 
 This creates `~/.local/share/yasashii/venv` with `mlx-lm`, `transformers`, `numba`,
-`numpy`, `beautifulsoup4` and `huggingface_hub`. Model weights download on first use.
+`numpy`, `beautifulsoup4`, `markdown-it-py` and `huggingface_hub`.
+Model weights download on first use.
 
 ## Usage
 
 ```bash
 yasashii report.html
+yasashii notes.md
+yasashii message.txt
+cat draft.md | yasashii --format markdown
+yasashii draft.md --stdout
 yasashii report.html --model 2b --glossary terms.json
 yasashii report.html --context background.txt
 yasashii report.html --limit 20      # try the first 20 sentences
@@ -78,9 +95,28 @@ yasashii report.html --dry-run       # count target sentences only
 | `--model 8b` | 6GB, not benchmarked here |
 | `--glossary terms.json` | Fix terminology (see below) |
 | `--context background.txt` | Optional reference context; not enabled by default |
-| `--out path.html` | Output path |
+| `--format text/markdown/html` | Override detection; stdin defaults to text |
+| `--stdout` | Return rewritten file content to stdout |
+| `--out path` | Output path |
 | `--limit N` | Convert only the first N sentences |
 | `--dry-run` | Report counts without converting |
+
+For stdin or `--stdout`, stdout contains only the rewritten document and stderr
+contains diagnostics. If no eligible prose exists, the input passes through unchanged
+without loading the model. Unknown file extensions are refused, not silently treated
+as text. JSON/config/code files are not prose.
+
+### Other deliverables and agent replies
+
+Use the `yasashii` skill before finalizing Japanese replies, Markdown, email drafts,
+document text or slide text. Compare the proposed rewrite with the original for
+changed actors, negation, conditions or certainty, then use the accepted wording
+in the target authoring tool. Do not display both drafts in every chat reply.
+
+This is a shared finishing workflow, not an OpenCode hook that silently intercepts
+every message. PDF, DOCX and PPTX binaries are not edited directly: rewrite the prose
+before rendering them, or use their format-aware authoring tools.
+Exact quotations and complex Markdown blocks may intentionally remain unchanged.
 
 ## Glossary
 
@@ -127,7 +163,9 @@ does **not** establish faster inference. Safety is gained partly by preserving
 more source text. The old run rewrote a title and an anchor and introduced two
 extra `1`s; earlier informal preservation claims were incomplete.
 An adversarial repeated-text HTML suite passes 1/8 old vs 8/8 new.
-Ten unit tests pass. Semantic changes beyond lexical checks still require review.
+The current suite has 21 passing unit tests, including stdin/stdout, Markdown
+protection and original-file preservation. Semantic changes beyond lexical
+checks still require review.
 
 ## Accuracy regression benchmark
 
@@ -137,6 +175,7 @@ python bench/safety.py
 python bench/run.py --model 0.8b --output /mounted-storage/0.8b.json
 python bench/run.py --model 2b --output /mounted-storage/2b.json
 python bench/report.py report.html --output-dir /mounted-storage/report-bench
+python bench/formats.py --output-dir /mounted-storage/formats-bench
 ```
 
 Use the Python environment created by `setup.sh`.
@@ -147,6 +186,11 @@ Safety, numeric preservation, rewrite coverage and observed semantic errors are
 separate measures: an unchanged sentence is safe, but not a simplification.
 Glossaries help technical vocabulary; context+glossary can still make a sentence
 worse. Neither is a hard constraint or an automatic guarantee of meaning.
+
+The format benchmark checks the same four prose inputs in text, Markdown and HTML
+three times each. All three produce the same rewritten prose; numeric literals
+and the Markdown code/quote/link/table fixture are preserved. This verifies shared
+processing and format protection, not general language accuracy.
 
 ### Why these changes
 

@@ -11,7 +11,7 @@ if [ ! -x "$ROOT/venv/bin/python" ]; then
 fi
 
 "$ROOT/venv/bin/pip" install -q -U pip
-"$ROOT/venv/bin/pip" install -q -U mlx-lm transformers numba numpy beautifulsoup4 huggingface_hub
+"$ROOT/venv/bin/pip" install -q -U mlx-lm transformers numba numpy beautifulsoup4 huggingface_hub markdown-it-py
 
 echo "完了: $ROOT/venv"
 echo "試す: $(cd "$(dirname "$0")" && pwd)/bin/yasashii --help"

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""やさしい日本語コンバータ（HTML）
+"""文章共通のやさしい日本語コンバータ。
 
-PLaMo 3 Translate の target_lang="ja-easy" で、HTML のテキストノードだけを
-文単位でやさしい日本語に変換し、<name>.yasashii.html を併産する。
-原文ファイルは変更しない。
+PLaMo 3 Translate の target_lang="ja-easy" で、文章を言い換えて検査する。
+テキスト・Markdown・HTMLの保護対象を残し、ファイルは別名で併産する。
+標準入力では、変換した文章を標準出力に返す。
 
 使い方:
     yasashii report.html
@@ -207,8 +207,68 @@ class TextSpans(HTMLParser):
         self.spans.append((start, start + len(data), data))
 
 
-def convert_html(raw, easy, glossary=None, limit=None, context=None):
-    spans = TextSpans(raw).spans
+def prose_spans(raw, markdown=False):
+    """Select complete prose lines, keeping document syntax outside edit ranges."""
+    lines = raw.splitlines(keepends=True)
+    allowed = set(range(len(lines)))
+    if markdown:
+        from markdown_it import MarkdownIt
+
+        allowed = set()
+        ancestors = []
+        for token in MarkdownIt("commonmark").parse(raw):
+            if token.nesting == -1:
+                ancestors.pop()
+            if token.type == "inline" and token.map and "blockquote_open" not in ancestors:
+                if all(c.type in {"text", "softbreak"} for c in token.children or []):
+                    allowed.update(range(*token.map))
+            if token.nesting == 1:
+                ancestors.append(token.type)
+        # CommonMark has no YAML front matter; don't mistake metadata for prose.
+        if lines and lines[0].strip() == "---":
+            for i, line in enumerate(lines[1:], 1):
+                allowed.discard(i)
+                if line.strip() in {"---", "..."}:
+                    break
+            allowed.discard(0)
+    spans, offset = [], 0
+    fence = None
+    for i, line in enumerate(lines):
+        marker = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if marker:
+            value = marker.group(1)
+            if fence is None:
+                fence = value
+            elif value[0] == fence[0] and len(value) >= len(fence):
+                fence = None
+            offset += len(line)
+            continue
+        if fence is not None:
+            offset += len(line)
+            continue
+        prefix = re.match(r"^[ \t]*(?:(?:#{1,6}|[-+*]|\d+[.)])[ \t]+)?", line).end()
+        content = line[prefix:].rstrip("\r\n")
+        text = content.strip()
+        protected = re.search(r'https?://|(?:~|/)[\w./-]+|[`<>\\「『]|"[^"]+"', content)
+        if markdown and "|" in content:
+            protected = True
+        if (i in allowed and len(text) >= 6 and JP.search(text)
+                and text.endswith(("。", "！", "？"))
+                and not text.startswith(CONT_START + (">", "「", "『", '"'))
+                and not protected):
+            spans.append((offset + prefix, offset + prefix + len(content), content))
+        offset += len(line)
+    return spans
+
+
+def document_spans(raw, format):
+    if format == "html":
+        return TextSpans(raw).spans
+    return prose_spans(raw, markdown=format == "markdown")
+
+
+def convert_document(raw, easy, glossary=None, limit=None, context=None, format="text"):
+    spans = document_spans(raw, format)
     if limit is not None:
         spans = spans[:limit]
     edits, reverted = [], []
@@ -219,10 +279,21 @@ def convert_html(raw, easy, glossary=None, limit=None, context=None):
             out = easy(part, glossary, max_tokens=max(96, min(2048, int(len(part) * 2.5))),
                        context=context).strip()
             reason = verify(part, out)
+            if format == "markdown" and not reason:
+                from markdown_it import MarkdownIt
+
+                tokens = MarkdownIt("commonmark").parse(out)
+                if ("\n" in out or "\r" in out
+                        or [t.type for t in tokens] != ["paragraph_open", "inline", "paragraph_close"]
+                        or any(c.type != "text" for t in tokens for c in t.children or [])):
+                    reason = "markdown-changed"
             if reason:
                 reverted.append({"reason": reason, "src": part, "out": out})
             parts.append(part if reason else out)
-        edits.append((start, end, lead + html_mod.escape("".join(parts), quote=False) + trail))
+        rewritten = "".join(parts)
+        if format == "html":
+            rewritten = html_mod.escape(rewritten, quote=False)
+        edits.append((start, end, lead + rewritten + trail))
     for start, end, replacement in reversed(edits):
         raw = raw[:start] + replacement + raw[end:]
     return raw, {
@@ -231,32 +302,45 @@ def convert_html(raw, easy, glossary=None, limit=None, context=None):
     }
 
 
+def convert_html(raw, easy, glossary=None, limit=None, context=None):
+    return convert_document(raw, easy, glossary, limit, context, format="html")
+
+
 def main():
-    ap = argparse.ArgumentParser(description="HTMLをやさしい日本語に変換する")
-    ap.add_argument("file")
+    ap = argparse.ArgumentParser(description="文章・Markdown・HTMLをやさしい日本語に変換する")
+    ap.add_argument("file", nargs="?", default="-", help="入力ファイル。省略または - で標準入力")
+    ap.add_argument("--format", choices=["text", "markdown", "html"], help="省略時は拡張子で判定。標準入力はtext")
+    ap.add_argument("--stdout", action="store_true", help="変換した文章を標準出力に返す")
     ap.add_argument("--model", default="0.8b", choices=sorted(MODELS))
     ap.add_argument("--glossary", help="用語集JSON（[{\"source\":..,\"target\":..}]）")
-    ap.add_argument("--out", help="出力先（既定: <name>.yasashii.html）")
+    ap.add_argument("--out", help="出力先（既定: <name>.yasashii.<元の拡張子>）")
     ap.add_argument("--limit", type=int, help="先頭N件だけ変換（試用）")
     ap.add_argument("--dry-run", action="store_true", help="対象件数だけ表示")
     ap.add_argument("--context", help="用語や背景の参照テキスト（指示文ではない）")
     args = ap.parse_args()
 
-    src_path = Path(args.file).expanduser()
-    if not src_path.exists():
-        die(f"ファイルがありません: {src_path}")
-    if src_path.name.endswith(".yasashii.html"):
+    if args.stdout and args.out:
+        ap.error("--stdout と --out は同時に指定できません")
+    if args.limit is not None and args.limit < 0:
+        ap.error("--limit は0以上で指定してください")
+    src_path = Path(args.file).expanduser() if args.file != "-" else None
+    formats = {".html": "html", ".htm": "html", ".md": "markdown",
+               ".markdown": "markdown", ".txt": "text", ".text": "text"}
+    format = args.format or (formats.get(src_path.suffix.lower()) if src_path else "text")
+    if format is None:
+        die("未対応の拡張子です。文章なら --format text を指定してください")
+    if src_path and ".yasashii" in src_path.stem:
         die("やさしい版を入力にしています")
-    out_path = Path(args.out).expanduser() if args.out else src_path.with_suffix(".yasashii.html")
-    if out_path.resolve() == src_path.resolve():
+    stream = args.stdout or (src_path is None and args.out is None)
+    out_path = Path(args.out).expanduser() if args.out else (
+        src_path.with_name(src_path.stem + ".yasashii" + src_path.suffix) if src_path and not stream else None)
+    if src_path and out_path and out_path.resolve() == src_path.resolve():
         die("出力先に原文は指定できません")
 
-    raw = src_path.read_text(encoding="utf-8")
-    nodes = [text for _, _, text in TextSpans(raw).spans]
-    if args.limit:
+    raw = src_path.read_text(encoding="utf-8") if src_path else sys.stdin.read()
+    nodes = [text for _, _, text in document_spans(raw, format)]
+    if args.limit is not None:
         nodes = nodes[: args.limit]
-    if not nodes:
-        die("変換対象の日本語テキストがありません")
     if args.dry_run:
         print(json.dumps({"nodes": len(nodes), "chars": sum(len(n) for n in nodes)},
                          ensure_ascii=False))
@@ -267,23 +351,27 @@ def main():
         glossary = json.loads(Path(args.glossary).expanduser().read_text(encoding="utf-8"))
 
     t0 = time.time()
-    easy = load_engine(args.model)
+    easy = load_engine(args.model) if nodes else None
     load_s = time.time() - t0
 
     t1 = time.time()
     context = Path(args.context).expanduser().read_text(encoding="utf-8") if args.context else None
-    out_raw, stats = convert_html(raw, easy, glossary, args.limit, context)
-    out_path.write_text(out_raw, encoding="utf-8")
+    out_raw, stats = convert_document(raw, easy, glossary, args.limit, context, format)
+    if stream:
+        sys.stdout.write(out_raw)
+    else:
+        out_path.write_text(out_raw, encoding="utf-8")
 
     elapsed = time.time() - t1
     print(json.dumps({
-        "input": str(src_path),
-        "output": str(out_path),
+        "input": str(src_path) if src_path else "-",
+        "output": "-" if stream else str(out_path),
+        "format": format,
         "model": args.model,
         **stats,
         "load_s": round(load_s, 2),
         "convert_s": round(elapsed, 2),
-    }, ensure_ascii=False, indent=1))
+    }, ensure_ascii=False, indent=1), file=sys.stderr if stream else sys.stdout)
 
 
 if __name__ == "__main__":
