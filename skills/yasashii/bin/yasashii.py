@@ -34,7 +34,7 @@ SKIP_TAGS = {
 }
 JP = re.compile(r"[ぁ-んァ-ヶー一-龠]")
 SENT = re.compile(r"(?<=[。！？])")
-NUM = re.compile(r"\d+(?:[.,]\d+)*")
+NUM = re.compile(r"[+−-]?(?:\d+(?:,\d+)*(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?")
 FORBIDDEN = "<|plamo:"
 
 
@@ -138,11 +138,22 @@ def verify(src: str, out: str) -> str | None:
         return "special-token"
     if src.endswith(("。", "！", "？")) and not out.strip().endswith(("。", "！", "？")):
         return "incomplete-sentence"
-    if sorted(NUM.findall(src)) != sorted(NUM.findall(out)):
+    if NUM.findall(src) != NUM.findall(out):
         return "numbers-changed"
-    quantities = r"\d+(?:[.,]\d+)*\s*(?:ms|[kMGT]?B|秒|分|時間|日|回|件|%|％)"
-    if sorted(re.findall(quantities, src)) != sorted(re.findall(quantities, out)):
+    quantities = NUM.pattern + r"\s*(?:[A-Za-zµμ]+|時間|年|月|日|時|分|秒|回|件|人|個|台|%|％)"
+    if re.findall(quantities, src) != re.findall(quantities, out):
         return "units-changed"
+    # 複雑な否定は小型モデルで反転したため、自動の言い換えを採用しない。
+    if src != out and re.search(r"無効化しない|無効にしない|禁止しない|できないわけでは|ないとは言えない", src):
+        return "complex-negation-review"
+    if "ください" not in src and "ください" in out:
+        return "instruction-added"
+    if re.search(r"か[。？?]$|[？?]$", src) and not re.search(r"か[。？?]$|[？?]$", out):
+        return "question-lost"
+    if re.search(r"ないか[。？?]$", src) and not re.search(r"ないか[。？?]$|ませんか[。？?]$", out):
+        return "negative-question-changed"
+    if "仕上げ" in src and not re.search(r"仕上げ|整え|完成", out):
+        return "finishing-action-lost"
     # 「出力を落とす→出力を取る」で除外が取得に反転した実例を保守的に戻す。
     if re.search(r"除外|削除|取り除|落とし", src) and not re.search(
             r"除外|削除|取り除|除い|除き|消し|削っ|外し|落と", out):
@@ -176,25 +187,44 @@ class TextSpans(HTMLParser):
         for m in re.finditer("\n", raw):
             self.starts.append(m.end())
         self.stack = []
-        self.spans = []
+        self.root = {"tag": "", "split": False}
+        self.candidates = []
         self.feed(raw)
+        self.spans = [(start, end, text) for start, end, text, parent in self.candidates
+                      if not parent["split"]]
 
     def handle_starttag(self, tag, attrs):
+        parent = self.stack[-1] if self.stack else self.root
+        parent["split"] = True
         if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input",
                        "link", "meta", "param", "source", "track", "wbr"}:
-            self.stack.append(tag)
+            self.stack.append({"tag": tag, "split": False})
 
     def handle_startendtag(self, tag, attrs):
-        pass
+        parent = self.stack[-1] if self.stack else self.root
+        parent["split"] = True
 
     def handle_endtag(self, tag):
-        if tag in self.stack:
-            self.stack = self.stack[:len(self.stack) - 1 - self.stack[::-1].index(tag)]
+        names = [parent["tag"] for parent in self.stack]
+        if tag in names:
+            self.stack = self.stack[:len(names) - 1 - names[::-1].index(tag)]
+
+    def handle_entityref(self, name):
+        parent = self.stack[-1] if self.stack else self.root
+        parent["split"] = True
+
+    def handle_charref(self, name):
+        self.handle_entityref(name)
+
+    def handle_comment(self, data):
+        parent = self.stack[-1] if self.stack else self.root
+        parent["split"] = True
 
     def handle_data(self, data):
         line, col = self.getpos()
         start = self.starts[line - 1] + col
-        if any(t in SKIP_TAGS | {"a"} for t in self.stack):
+        if any(t["tag"] in SKIP_TAGS | {"a", "strong", "em", "span", "b", "i", "mark", "small",
+                                      "sup", "sub"} for t in self.stack):
             return
         # Only complete sentences are rewritten. Fragment rewriting loses referents.
         text = data.strip()
@@ -202,9 +232,10 @@ class TextSpans(HTMLParser):
             return
         if text.startswith(CONT_START):
             return
-        if re.search(r"https?://|(?:~|/)[\w./-]+|`", text):
+        if re.search(r'https?://|(?:~|/)[\w./-]+|[`「『]|"[^"]+"', text):
             return
-        self.spans.append((start, start + len(data), data))
+        parent = self.stack[-1] if self.stack else self.root
+        self.candidates.append((start, start + len(data), data, parent))
 
 
 def prose_spans(raw, markdown=False):
@@ -221,7 +252,11 @@ def prose_spans(raw, markdown=False):
                 ancestors.pop()
             if token.type == "inline" and token.map and "blockquote_open" not in ancestors:
                 if all(c.type in {"text", "softbreak"} for c in token.children or []):
-                    allowed.update(range(*token.map))
+                    start, end = token.map
+                    # 折り返された文の後半だけを、独立した文章として変換しない。
+                    if end - start == 1 or all(
+                            lines[i].rstrip().endswith(("。", "！", "？")) for i in range(start, end)):
+                        allowed.update(range(start, end))
             if token.nesting == 1:
                 ancestors.append(token.type)
         # CommonMark has no YAML front matter; don't mistake metadata for prose.
@@ -249,6 +284,12 @@ def prose_spans(raw, markdown=False):
         prefix = re.match(r"^[ \t]*(?:(?:#{1,6}|[-+*]|\d+[.)])[ \t]+)?", line).end()
         content = line[prefix:].rstrip("\r\n")
         text = content.strip()
+        if not markdown and i > 0 and prefix == 0:
+            previous = lines[i - 1].strip()
+            if (previous and not previous.endswith(("。", "！", "？"))
+                    and not re.match(r"^(?:#{1,6}|[-+*]|\d+[.)])\s", previous)):
+                offset += len(line)
+                continue
         protected = re.search(r'https?://|(?:~|/)[\w./-]+|[`<>\\「『]|"[^"]+"', content)
         if markdown and "|" in content:
             protected = True
@@ -272,6 +313,7 @@ def convert_document(raw, easy, glossary=None, limit=None, context=None, format=
     if limit is not None:
         spans = spans[:limit]
     edits, reverted = [], []
+    changed_parts = 0
     for start, end, text in spans:
         lead, core, trail = split_lead_trail(text)
         parts = []
@@ -289,6 +331,8 @@ def convert_document(raw, easy, glossary=None, limit=None, context=None, format=
                     reason = "markdown-changed"
             if reason:
                 reverted.append({"reason": reason, "src": part, "out": out})
+            elif out != part:
+                changed_parts += 1
             parts.append(part if reason else out)
         rewritten = "".join(parts)
         if format == "html":
@@ -299,6 +343,7 @@ def convert_document(raw, easy, glossary=None, limit=None, context=None, format=
     return raw, {
         "nodes": len(spans), "chars": sum(len(t) for _, _, t in spans),
         "reverted": len(reverted), "unmatched": 0, "reverted_detail": reverted[:5],
+        "changed_parts": changed_parts, "review_required": changed_parts > 0,
     }
 
 
@@ -337,7 +382,12 @@ def main():
     if src_path and out_path and out_path.resolve() == src_path.resolve():
         die("出力先に原文は指定できません")
 
-    raw = src_path.read_text(encoding="utf-8") if src_path else sys.stdin.read()
+    if src_path:
+        with src_path.open(encoding="utf-8", newline="") as source:
+            raw = source.read()
+    else:
+        sys.stdin.reconfigure(newline="")
+        raw = sys.stdin.read()
     nodes = [text for _, _, text in document_spans(raw, format)]
     if args.limit is not None:
         nodes = nodes[: args.limit]
@@ -360,7 +410,8 @@ def main():
     if stream:
         sys.stdout.write(out_raw)
     else:
-        out_path.write_text(out_raw, encoding="utf-8")
+        with out_path.open("w", encoding="utf-8", newline="") as output:
+            output.write(out_raw)
 
     elapsed = time.time() - t1
     print(json.dumps({

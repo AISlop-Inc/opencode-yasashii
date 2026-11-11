@@ -1,80 +1,98 @@
 # opencode-yasashii
 
-An OpenCode skill and CLI that finish Japanese prose in easy Japanese with a local
-[PLaMo 3 Translate](https://huggingface.co/pfnet/plamo-3-translate-0.8b) model (MLX, Apple Silicon).
+日本語の文章を、やさしい日本語に仕上げるOpenCodeスキルとCLIです。
+Apple SiliconのMac上で、[PLaMo 3 Translate](https://huggingface.co/pfnet/plamo-3-translate-0.8b)をMLXで動かします。
 
-Use it for final replies, explanations, email drafts and document/slide prose
-before rendering them. Existing text, Markdown and HTML files can also be rewritten.
-The original file is never modified.
+チャットの最終回答、説明、メール案、文書やスライドへ入れる本文に使えます。
+テキスト・Markdown・HTMLファイルの変換にも対応しています。
+元のファイルは変えず、別の名前で保存します。
 
-```
+```bash
 yasashii report.html
 yasashii notes.md
 yasashii message.txt
 printf '当該機能を無効化する必要があります。' | yasashii
 ```
 
-## Why this exists
+## 目的
 
-Reports are written for people who already know the domain. The same report is then
-read by people who do not. This skill produces a second copy where the body text is
-rewritten in easy Japanese, while code, links, attributes and markup are protected.
-Table prose may change; numerical literals and their units must be preserved.
+専門知識を持つ人向けに書かれた文章を、詳しくない人も読めるようにするための道具です。
+コードやリンク、文書の構造を守りながら、説明文を言い換えます。
+表の説明文は変わる場合がありますが、数値と単位は保持します。
 
-It is a **reading aid**, not a replacement: the original stays the source of truth.
+**原文に代わるものではなく、読むための補助です。**
+変換後も、原文と比べて意味を確認してください。
 
-## How it works
+## 仕組み
 
-- Shares one rewriting/validation pipeline across plain text, Markdown and HTML.
-  stdin/stdout lets agents finish prose before putting it into any final format.
-- Text files become `name.yasashii.txt`, Markdown becomes `name.yasashii.md`,
-  and HTML becomes `name.yasashii.html`.
-- Uses official PFML3 `target_lang="ja-easy"`, explicit `source_lang="ja"` and
-  temperature-zero greedy decoding. This
-  rewrites Japanese into Japanese instead of translating to another language.
-- Uses HTMLParser source offsets, not text searching: repeated text in an
-  attribute, comment or script cannot redirect an edit there.
-- Skips links, code, scripts, styles, SVG, attributes, non-sentence labels,
-  URL/path/backtick-containing nodes and continuations starting with particles.
-- Markdown uses CommonMark parsing (`markdown-it-py`) and source offsets to keep
-  fences, indented code, quotes, links, emphasis and embedded HTML intact.
-  YAML front matter and pipe tables are also kept. Complex marked-up paragraphs
-  are preserved rather than partially rewritten without context.
-- Reverts a sentence to the original when:
-  - numbers or units changed (including added `1`s),
-  - a code identifier or backticked string disappeared,
-  - Japanese turned into English, or a new Latin word appeared,
-  - the length ratio falls outside 0.5–2.2x,
-  - a label of 15 chars or fewer became a sentence,
-  - a complete sentence was cut off without terminal punctuation.
-- Preserves capitalized Latin names and reverts suspected loss of an explicit
-  removal action (`除外` / `削除` / `落とし`). This is a conservative lexical check,
-  not a general semantic validator.
-- Prints a JSON summary: nodes, chars, reverted sentences with reasons, unmatched positions.
+- テキスト・Markdown・HTMLで、言い換えと検査の処理を共通化しています。
+  標準入力と標準出力を使えば、文書の形式に組み込む前の文章にも使えます。
+- ファイルの出力名は、元の名前に `.yasashii` を加えたものです。
+  - `name.txt` → `name.yasashii.txt`
+  - `name.md` → `name.yasashii.md`
+  - `name.html` → `name.yasashii.html`
+- 入力言語は `source_lang="ja"`、出力言語は公式の指定である `target_lang="ja-easy"` です。
+  温度0のgreedy生成で、別の言語ではなく、やさしい日本語へ言い換えます。
+- HTMLは文字列検索ではなく、ソース上の位置を記録して置き換えます。
+  同じ文が属性やコメント、スクリプト内にあっても、置換先を取り違えません。
+- リンク、コード、スクリプト、スタイル、SVG、属性、文章になっていない見出しなどは変換しません。
+  URL・パス・バッククォートを含む部分や、助詞から始まる文の断片も残します。
+- Markdownは `markdown-it-py` でCommonMarkとして解析します。
+  コードブロック、字下げされたコード、引用、リンク、強調、埋め込みHTMLを保護します。
+  YAMLヘッダーと表も残します。
+  文脈を失うおそれのある複雑な段落は、無理に一部分だけ変換しません。
+- HTMLでも、子タグや文字参照で分かれた要素と、引用を含む文章は保護します。
+  折り返された文の後半だけを変換しないようにしています。
+- ファイルと標準入力では、CRLFの改行も保持します。
 
-## Install
+次の場合は、変換候補を採用せず、元の文章に戻します。
+
+- 数値の出現順や単位が変わった場合。
+  数字の追加、比較値の入れ替わり、符号や指数表記の変更も検査します。
+- コード識別子や、大文字で始まる英語の名前などが失われた場合。
+- 日本語が英語に変わったり、原文にない英単語が増えたりした場合。
+- 文字数が原文の0.5〜2.2倍の範囲を外れた場合。
+- 15文字以下の短い見出しが、勝手に文になった場合。
+- 完結した文が、文末の句読点なしで途切れた場合。
+- 複雑な否定、利用者への指示の追加、仕上げ処理の意味の消失が疑われる場合。
+- 「除外」「削除」「落とし」など、取り除く行為が失われた疑いがある場合。
+
+これらは**限られた語句や形式の検査であり、意味全体を判定する仕組みではありません。**
+処理結果はJSONで返し、対象数、文字数、原文へ戻した件数と理由などを確認できます。
+変更した文章がある場合は `review_required: true` を返します。
+これは承認済みの印ではなく、**採用前に原文との照合が必要という印**です。
+
+## インストール
 
 ```bash
 git clone git@github.com:AISlop-Inc/opencode-yasashii.git
 cd opencode-yasashii
-./install.sh          # links skills/yasashii into ~/.config/opencode/skills/yasashii
-./install.sh --copy   # copies instead of symlinking
+./install.sh          # スキルを ~/.config/opencode/skills/yasashii へリンク
+./install.sh --copy   # リンクではなくコピーする場合
 ```
 
-`install.sh` also links the `yasashii` command into `~/.local/bin`, so it can be
-called from any shell.
+`install.sh` は、CLIも `~/.local/bin/yasashii` にリンクします。
+このディレクトリがPATHにあれば、どこからでも呼び出せます。
 
-First run of the converter needs its Python environment:
+初回は、Pythonの実行環境を作ってください。
 
 ```bash
 bash ~/.config/opencode/skills/yasashii/setup.sh
 ```
 
-This creates `~/.local/share/yasashii/venv` with `mlx-lm`, `transformers`, `numba`,
-`numpy`, `beautifulsoup4`, `markdown-it-py` and `huggingface_hub`.
-Model weights download on first use.
+`~/.local/share/yasashii/venv` に仮想環境を作り、次のパッケージを入れます。
 
-## Usage
+- `mlx-lm`
+- `transformers`
+- `numba`
+- `numpy`
+- `beautifulsoup4`
+- `markdown-it-py`
+- `huggingface_hub`
+
+モデルの重みは、最初に実行するときにダウンロードします。
+
+## 使い方
 
 ```bash
 yasashii report.html
@@ -84,44 +102,55 @@ cat draft.md | yasashii --format markdown
 yasashii draft.md --stdout
 yasashii report.html --model 2b --glossary terms.json
 yasashii report.html --context background.txt
-yasashii report.html --limit 20      # try the first 20 sentences
-yasashii report.html --dry-run       # count target sentences only
+yasashii report.html --limit 20      # 先頭20箇所だけ試す
+yasashii report.html --dry-run       # 変換せずに対象数を確認する
 ```
 
-| Option | Meaning |
+| オプション | 用途 |
 |---|---|
-| `--model 0.8b` | Default. Small, fast; technical jargon often remains |
-| `--model 2b` | Alternative; not automatically more faithful |
-| `--model 8b` | 6GB, not benchmarked here |
-| `--glossary terms.json` | Fix terminology (see below) |
-| `--context background.txt` | Optional reference context; not enabled by default |
-| `--format text/markdown/html` | Override detection; stdin defaults to text |
-| `--stdout` | Return rewritten file content to stdout |
-| `--out path` | Output path |
-| `--limit N` | Convert only the first N sentences |
-| `--dry-run` | Report counts without converting |
+| `--model 0.8b` | 既定のモデル。小さくて速い一方、専門用語は残りやすい |
+| `--model 2b` | 比較用のモデル。大きくしても意味が正確になるとは限らない |
+| `--model 8b` | 重みは約6GB。このリポジトリでは未評価 |
+| `--glossary terms.json` | 用語の言い換えを指定する |
+| `--context background.txt` | 参照する背景情報を渡す。既定では使わない |
+| `--format text/markdown/html` | 入力形式を指定する。標準入力の既定はtext |
+| `--stdout` | ファイルから変換した文章を標準出力へ返す |
+| `--out path` | 出力先を指定する |
+| `--limit N` | 先頭N箇所だけ変換する |
+| `--dry-run` | 変換せずに対象数と文字数を返す |
 
-For stdin or `--stdout`, stdout contains only the rewritten document and stderr
-contains diagnostics. If no eligible prose exists, the input passes through unchanged
-without loading the model. Unknown file extensions are refused, not silently treated
-as text. JSON/config/code files are not prose.
+標準入力や `--stdout` では、標準出力には変換した文章だけを返します。
+検査結果は標準エラー出力へ返すので、パイプで次の処理へ渡せます。
+変換できる文章がなければ、モデルを読み込まずに入力をそのまま返します。
 
-### Other deliverables and agent replies
+未知の拡張子を、勝手にテキストとして扱うことはありません。
+JSON、設定、ソースコードなどの機械が読むデータは、文章の変換対象ではありません。
 
-Use the `yasashii` skill before finalizing Japanese replies, Markdown, email drafts,
-document text or slide text. Compare the proposed rewrite with the original for
-changed actors, negation, conditions or certainty, then use the accepted wording
-in the target authoring tool. Do not display both drafts in every chat reply.
+### チャットや、ほかの成果物に使う
 
-This is a shared finishing workflow, not an OpenCode hook that silently intercepts
-every message. PDF, DOCX and PPTX binaries are not edited directly: rewrite the prose
-before rendering them, or use their format-aware authoring tools.
-Exact quotations and complex Markdown blocks may intentionally remain unchanged.
+日本語の最終回答、メール案、文書やスライドの本文を作った後に、`yasashii` スキルを使います。
+原文と候補を比べ、次の点を確認してから採用します。
 
-## Glossary
+- 誰が何をするかが変わっていないか。
+- 否定や条件が変わっていないか。
+- 確定した事実と、未確認のことが混ざっていないか。
+- 説明が利用者への指示に変わっていないか。
+- 不自然な助詞や、同じ表現の重複がないか。
 
-Pass a JSON list to lock terminology. The model uses it as context, so inflections
-and particles are still handled:
+確認した文章を、回答や成果物の作成ツールへ渡してください。
+チャットでは、毎回二つの版を表示する必要はありません。
+
+**すべてのメッセージを勝手に書き換えるOpenCodeのフックではありません。**
+文章を仕上げるための共通手順です。
+PDF・DOCX・PPTXを直接編集する機能はなく、組み込む前の本文を変換します。
+既存の文書を編集する場合は、その形式に対応した作成ツールを使ってください。
+厳密な引用や複雑なMarkdownは、意図的に原文のまま残すことがあります。
+
+## 用語集
+
+用語の言い換えを指定したい場合は、JSONのリストを渡します。
+モデルへの参考情報として渡すので、助詞や活用も文脈に合わせて処理します。
+ただし、必ず指定どおりになるという保証はありません。
 
 ```json
 [
@@ -130,94 +159,126 @@ and particles are still handled:
 ]
 ```
 
-Without a glossary the 0.8B model leaves katakana loanwords untouched, and can mistranslate
-technical terms (`埋め込みベクトル` → `埋め込まれたベクトル`).
+用語集がないと、0.8Bモデルはカタカナの専門用語を残すことがあります。
+専門用語を誤って解釈する場合もあります。
+過去の検証では、「埋め込みベクトル」が「埋め込まれたベクトル」に変わる例がありました。
 
-## Measured results (2026-11-11)
+## 最初の精度検証の結果
 
-18 diagnostic inputs (13 prose, 2 labels, 3 protected inputs), Apple M3 Pro,
-three sequential sweeps per variant. Times are medians, excluding model loading.
-The safer variants rewrite 13 inputs; the others are intentionally preserved.
+以下は、2026年11月11日の最初の精度検証で得た値です。
+現在の追加修正より前の、コミット `3f6d5ae` 時点の結果として示します。
 
-| Model / variant | Time | Observed language outcome |
+Apple M3 Proで、18入力を各設定で3回ずつ処理しました。
+入力の内訳は、本文13例、見出し2例、保護対象3例です。
+時間はモデルの読み込みを除いた中央値です。
+保護を加えた方式は本文13例を変換し、残りはそのまま残しました。
+
+| モデル・方式 | 処理時間 | 観測した言い換え |
 |---|---|---|
-| 0.8b / safer default | 1.135s | Keeps embedding terminology, jargon remains |
-| 0.8b / glossary | 1.466s | Rewrites all four selected technical terms |
-| 2b / safer default | 6.378s | Confuses latency with availability in one example |
-| 2b / glossary | 7.869s | Fixes that example; embedding jargon remains |
-| 2b / glossary + context | 8.365s | That latency error returns |
+| 0.8b・保護付きの既定方式 | 1.135秒 | 埋め込みの用語は保持。専門用語は残る |
+| 0.8b・用語集あり | 1.466秒 | 選んだ4つの専門用語を言い換えた |
+| 2b・保護付き | 6.378秒 | 遅延の許容を、利用できるかどうかと取り違えた |
+| 2b・用語集あり | 7.869秒 | 上の取り違えは改善。埋め込みの用語は残る |
+| 2b・用語集と背景情報あり | 8.365秒 | 遅延の取り違えが再発した |
 
-All 18 inputs preserve numeric literals; outputs match across all three repeats.
-These checks are not an overall meaning-accuracy score or a reader study.
+全18入力で数値が一致し、3回の出力も同じでした。
+これは数値と再現性の確認であり、文章全体の意味の正確さや、読み手の理解度を測った結果ではありません。
 
-A separate end-to-end report run (one run each, 71,912 input bytes):
+別の検証では、71,912バイトの実レポートを、各方式で1回ずつ処理しました。
 
-| Variant | Candidate nodes | Time | Protected elements / numbers preserved |
+| 方式 | 変換候補数 | 処理時間 | 保護対象・数値の保持 |
 |---|---|---|---|
-| Old CLI (`0038c01`) | 265 | 32.536s | No / No |
-| Safer default | 135 | 19.429s | Yes / Yes |
-| Safer + glossary | 135 | 21.532s | Yes / Yes |
+| 旧CLI `0038c01` | 265 | 32.536秒 | どちらも変更あり |
+| 保護付きの既定方式 | 135 | 19.429秒 | どちらも保持 |
+| 保護と用語集あり | 135 | 21.532秒 | どちらも保持 |
 
-The safer selection processes 6,099 chars vs the old 9,799: the lower runtime
-does **not** establish faster inference. Safety is gained partly by preserving
-more source text. The old run rewrote a title and an anchor and introduced two
-extra `1`s; earlier informal preservation claims were incomplete.
-An adversarial repeated-text HTML suite passes 1/8 old vs 8/8 new.
-The current suite has 21 passing unit tests, including stdin/stdout, Markdown
-protection and original-file preservation. Semantic changes beyond lexical
-checks still require review.
+保護付きの方式が処理したのは6,099文字で、旧方式は9,799文字です。
+対象を減らしているため、時間の減少をモデル自体の高速化とは扱えません。
+安全のために、より多くの文章を原文のまま残しています。
 
-## Accuracy regression benchmark
+旧方式ではタイトルとリンクの文章が変わり、数字の「1」が二つ追加されていました。
+以前の「すべて保持できている」という確認は、不十分でした。
+同じ文を保護領域にも置く8ケースの試験は、旧方式が1件、新方式が8件通過しました。
+
+## 追加の品質確認
+
+主語、否定、条件、数値、実施済み・未実施を確認するため、原文の意味を明記した30例で実際に推論しました。
+その後、対策の調整に使っていない12例を追加で確認しました。
+比較したのは、既定の0.8B、用語集を使う0.8B、用語集を使う2Bです。
+
+この確認で、次の問題が見つかりました。
+
+- 否定が反転する。
+- 処理方針の説明が、利用者への指示に変わる。
+- 仕上げ処理を共通化する話が、文章の形式をそろえる話に変わる。
+- 数値の順序や単位の変更を見逃す。
+- 引用や、文の断片を変換してしまう。
+- 変換しないファイルでも、改行形式が変わる。
+
+見つかった問題には、原文へ戻す検査や、変換対象から外す対策を追加しました。
+**現在の単体テストは33件すべて通過しています。**
+標準入出力、Markdownの保護、原文ファイルの保持なども対象です。
+
+一方で、追加12例では既定の0.8Bに意味の懸念が2例残りました。
+不自然な日本語も残るため、**文書全体を無条件に書き換えて採用できる品質とは判断していません。**
+小規模な合成例をAIが照合した結果であり、独立した人間の評価や、一般的な正解率を示すものではありません。
+語句の検査を通過した候補にも、原文との照合が必要です。
+
+## 検証を再実行する
+
+`setup.sh` が作ったPythonの仮想環境を使って実行してください。
+結果の保存先は、利用する環境に合わせて指定します。
 
 ```bash
+source ~/.local/share/yasashii/venv/bin/activate
 python -m unittest discover -s tests -v
 python bench/safety.py
 python bench/run.py --model 0.8b --output /mounted-storage/0.8b.json
 python bench/run.py --model 2b --output /mounted-storage/2b.json
 python bench/report.py report.html --output-dir /mounted-storage/report-bench
 python bench/formats.py --output-dir /mounted-storage/formats-bench
+python bench/quality.py --output /mounted-storage/quality.json
+python bench/quality.py --cases bench/quality_holdout.json --output /mounted-storage/holdout.json
 ```
 
-Use the Python environment created by `setup.sh`.
-The benchmark freezes the old implementation at commit `0038c01`.
-It compares the old language-code path, explicit source/target, conservative HTML
-selection, glossary, context, and glossary+context on 18 diagnostic examples.
-Safety, numeric preservation, rewrite coverage and observed semantic errors are
-separate measures: an unchanged sentence is safe, but not a simplification.
-Glossaries help technical vocabulary; context+glossary can still make a sentence
-worse. Neither is a hard constraint or an automatic guarantee of meaning.
+最初の精度検証は、旧実装をコミット `0038c01` に固定して比較します。
+同じ18例で、言語指定、HTMLの保護、用語集、背景情報、それらの組み合わせを比べます。
+安全性、数値の保持、書き換えた量、意味の問題は、別々に確認します。
+原文を残せば安全でも、読みやすく言い換えたことにはなりません。
 
-The format benchmark checks the same four prose inputs in text, Markdown and HTML
-three times each. All three produce the same rewritten prose; numeric literals
-and the Markdown code/quote/link/table fixture are preserved. This verifies shared
-processing and format protection, not general language accuracy.
+形式別の検証では、同じ4つの文章をテキスト・Markdown・HTMLで3回ずつ処理します。
+3形式で同じ言い換えが得られ、数値とMarkdownのコード・引用・リンク・表が保持されることを確認します。
+これは共通処理と形式の保護の確認であり、一般的な日本語の正確さの評価ではありません。
 
-### Why these changes
+品質確認のスクリプトは、原文、保持すべき意味、モデルの候補、最終出力を記録します。
+用語集や背景情報は役立つ場合もありますが、誤訳を防ぐ強制的な制約ではありません。
 
-- [Official MLX chat template](https://huggingface.co/pfnet/plamo-3-translate-2b-MLX-4bit/blob/main/chat_template.jinja)
-  normalizes `ja(easy)` to PFML3 `ja-easy`. The older mixed34 template did not,
-  so using the canonical code avoids relying on the alias implementation.
-- [Official MLX model card](https://huggingface.co/pfnet/plamo-3-translate-2b-MLX-4bit)
-  documents glossary and reference context, and uses temperature-zero sampling.
-  They are translation inputs, not hard fidelity constraints.
-- [Japanese simplification research (Urakawa et al., 2024)](https://aclanthology.org/2024.lrec-main.57/)
-  and [READI 2024](https://aclanthology.org/2024.readi-1.1/) motivate inspecting
-  additions/omissions and evaluating simplicity separately from meaning.
+### 対策の根拠
 
-Larger models, more context and a larger glossary are not automatically better.
-Use a short, reviewed glossary; inspect negation, conditions, actions and uncertainty.
+- [公式MLXチャットテンプレート](https://huggingface.co/pfnet/plamo-3-translate-2b-MLX-4bit/blob/main/chat_template.jinja)は、`ja(easy)` をPFML3の `ja-easy` に正規化します。
+  古いmixed34のテンプレートにはこの処理がないため、正式な指定を直接使います。
+- [公式MLXモデルの説明](https://huggingface.co/pfnet/plamo-3-translate-2b-MLX-4bit)は、用語集と背景情報、温度0での生成を説明しています。
+  これらは翻訳の参考情報であり、意味の保持を強制するものではありません。
+- [日本語の忠実な簡単化に関する研究](https://aclanthology.org/2024.lrec-main.57/)と[READI 2024の研究](https://aclanthology.org/2024.readi-1.1/)は、情報の追加・省略を調べ、読みやすさと意味の保持を分けて評価する重要性を示しています。
 
-## Requirements
+モデル、背景情報、用語集を大きくすれば、必ず良くなるわけではありません。
+文脈に合う短い用語集を使い、否定、条件、行為、未確認の扱いを確認してください。
 
-- Apple Silicon Mac (MLX), Python 3.12+
-- Weights: ~423MB (0.8b), ~2.4GB (2b), ~6GB (8b), plus the Python environment
+## 動作環境
 
-## License
+- Apple Silicon搭載のMacとMLX。
+- Python 3.12以降。
+- モデルの重みとPython環境を置く空き容量。
+  重みは0.8Bが約423MB、2Bが約2.4GB、8Bが約6GBです。
 
-Code: MIT.
+## ライセンス
 
-Model: PLaMo 3 Translate is distributed under the
-[PLaMo Community License](https://plamo.preferredai.jp/info/plamo-community-license-en).
-Non-commercial use is free. Commercial use requires prior registration with Preferred
-Networks and is limited to companies with annual revenue under 1 billion yen.
-Weights are not redistributed here; they are downloaded from Hugging Face at runtime.
+コードはMITライセンスです。
+
+モデルには、[PLaMo Community License](https://plamo.preferredai.jp/info/plamo-community-license-en)が適用されます。
+非商用利用は無料です。
+商用利用にはPreferred Networksへの事前登録が必要で、年商10億円以下などの条件があります。
+利用前にライセンス本文を確認してください。
+
+このリポジトリでモデルの重みを再配布することはありません。
+実行時にHugging Faceからダウンロードします。
